@@ -34,7 +34,17 @@ var categories = map[string]string{
 	"indian":    "https://www.tiava.com/category/indian",
 	"hot-mom":   "https://www.tiava.com/category/hot-mom",
 	"share-bed": "https://www.tiava.com/category/share-bed",
+
+	"indian-hd":                              "https://www.tiava.com/category/indian-hd",
+	"viral":                                  "https://www.tiava.com/category/viral",
+	"cute-indian":                            "https://www.tiava.com/category/cute-indian",
+	"girlfriend":                             "https://www.tiava.com/category/girlfriend",
+	"first-time-indian":                      "https://www.tiava.com/category/first-time-indian",
+	"pakistani":                              "https://www.tiava.com/category/pakistani",
+	"trans?orientation=straight-and-shemale": "https://www.tiava.com/category/trans?orientation=straight-and-shemale",
+	"gay?orientation=straight-and-gay":       "https://www.tiava.com/category/gay?orientation=straight-and-gay",
 }
+
 
 func buildFilter(site string) string {
 	return "?filter%5Badvertiser_publish_date%5D=&filter%5Bduration%5D=&filter%5Bquality%5D=&filter%5Bvirtual_reality%5D=&filter%5Badvertiser_site%5D=" + site + "&filter%5Border_by%5D=popular"
