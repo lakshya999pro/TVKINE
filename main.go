@@ -1,738 +1,539 @@
-// XWorld Backend — Go port of xserver.js
-// Run: go mod tidy && go run main.go
 package main
 
 import (
-	"context" // Add this to your imports at the top
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
-const PORT = 1234
+const PORT = 1235
 
-// ─── Site config ─────────────────────────────────────────────────────────────
-
-type siteSection struct {
-	Slug string
-	Name string
-}
-
-type siteConfig struct {
-	Base     string
-	Headers  map[string]string
-	Cookies  map[string]string
-	Sections []siteSection
-}
-
-var sites = map[string]siteConfig{
-	"xhamster": {
-		Base: "https://xhamster.com",
-		Headers: map[string]string{
-			"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-			"Accept-Language": "en-US,en;q=0.9",
-			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-			"Referer":         "https://xhamster.com/",
-		},
-		Cookies: map[string]string{"video_titles_translation": "0", "geo": "us"},
-		Sections: []siteSection{
-			{"/4k", "4K"}, {"/hd", "1080p"}, {"/categories/teen", "Teen"},
-			{"/categories/milf", "MILF"}, {"/categories/mature", "Mature"}, {"/categories/amateur", "Amateur"},
-			{"/categories/big-ass", "Big Ass"}, {"/categories/anal", "Anal"}, {"/categories/hardcore", "Hardcore"},
-			{"/categories/homemade", "Homemade"}, {"/categories/lesbian", "Lesbian"}, {"/categories/asian", "Asian"},
-		},
-	},
-	"xvideos": {
-		Base: "https://www.xvideos.com",
-		Headers: map[string]string{
-			"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-			"Accept-Language": "en-US,en;q=0.9",
-			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-			"Referer":         "https://www.xvideos.com/",
-		},
-		Cookies: map[string]string{},
-		Sections: []siteSection{
-			{"", "Featured"}, {"/c/Amateur-65", "Amateur"}, {"/c/Anal-12", "Anal"},
-			{"/c/Big_Tits-23", "Big Tits"}, {"/c/Big_Ass-24", "Big Ass"}, {"/c/Milf-19", "MILF"},
-			{"/c/Mature-38", "Mature"}, {"/c/Teen-13", "Teen"}, {"/c/Lesbian-26", "Lesbian"},
-			{"/c/Blowjob-15", "Blowjob"}, {"/c/Creampie-40", "Creampie"},
-		},
+// ⚡ FAST HTTP CLIENT
+var client = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     30 * time.Second,
 	},
 }
 
-var httpClient = &http.Client{Timeout: 15 * time.Second}
-
-func init() {
-	// Force the Go resolver to use Google's Public DNS
-	// This bypasses the [::1]:53 "Connection Refused" error on Android
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{
-				Timeout: time.Second * 5,
-			}
-			return d.DialContext(ctx, "udp", "8.8.8.8:53")
-		},
-	}
+// ─────────────────────────────────────────
+// Categories
+var categories = map[string]string{
+	"indian":    "https://www.tiava.com/category/indian",
+	"hot-mom":   "https://www.tiava.com/category/hot-mom",
+	"share-bed": "https://www.tiava.com/category/share-bed",
 }
 
-// ─── Fetch ────────────────────────────────────────────────────────────────────
-
-func fetchPage(pageURL, site string) (*goquery.Document, string, error) {
-	cfg := sites[site]
-	cookies := make([]string, 0, len(cfg.Cookies))
-	for k, v := range cfg.Cookies {
-		cookies = append(cookies, k+"="+v)
-	}
-
-	var lastErr error
-	for i := 0; i <= 2; i++ {
-		req, err := http.NewRequest("GET", pageURL, nil)
-		if err != nil {
-			return nil, "", err
-		}
-		for k, v := range cfg.Headers {
-			req.Header.Set(k, v)
-		}
-		if len(cookies) > 0 {
-			req.Header.Set("Cookie", strings.Join(cookies, "; "))
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			lastErr = err
-			time.Sleep(900 * time.Millisecond)
-			continue
-		}
-		defer resp.Body.Close()
-		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, "", err
-		}
-		html := string(b)
-		doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-		if err != nil {
-			return nil, "", err
-		}
-		return doc, html, nil
-	}
-	return nil, "", fmt.Errorf("fetch failed [%s]: %v", site, lastErr)
+func buildFilter(site string) string {
+	return "?filter%5Badvertiser_publish_date%5D=&filter%5Bduration%5D=&filter%5Bquality%5D=&filter%5Bvirtual_reality%5D=&filter%5Badvertiser_site%5D=" + site + "&filter%5Border_by%5D=popular"
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────
+// Fetch
 
-func absURL(href, base string) string {
-	href = strings.TrimSpace(href)
-	if href == "" {
+func fetch(u string) (*goquery.Document, string, error) {
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-CH-UA", `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`)
+	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
+
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	html := string(body)
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	return doc, html, err
+}
+
+// Decode Tiava
+
+func decodeOutURL(out string) string {
+	u, err := url.Parse(out)
+	if err != nil {
 		return ""
 	}
-	if strings.HasPrefix(href, "http") {
-		return href
+
+	encoded := u.Query().Get("l")
+	if encoded == "" {
+		return ""
 	}
-	if strings.HasPrefix(href, "//") {
-		return "https:" + href
+
+	decodedURL, _ := url.QueryUnescape(encoded)
+
+	data, err := base64.StdEncoding.DecodeString(decodedURL)
+	if err != nil {
+		return ""
 	}
-	if strings.HasPrefix(href, "/") {
-		return base + href
+
+	str := string(data)
+
+	if strings.Contains(str, "http") {
+		return str[strings.Index(str, "http"):]
 	}
-	return base + "/" + href
+	return ""
 }
 
-// extractJsonObject does brace-counting JSON extraction from raw HTML
-func extractJsonObject(html, varName string) map[string]interface{} {
-	marker := varName + "="
-	start := strings.Index(html, marker)
-	if start == -1 {
-		return nil
-	}
-	bStart := strings.Index(html[start+len(marker):], "{")
-	if bStart == -1 {
-		return nil
-	}
-	bStart += start + len(marker)
+// ─────────────────────────────────────────
+// Video Struct
 
-	depth := 0
-	inStr := false
-	esc := false
-	strCh := rune(0)
-
-	for i, ch := range html[bStart:] {
-		if esc {
-			esc = false
-			continue
-		}
-		if ch == '\\' && inStr {
-			esc = true
-			continue
-		}
-		if !inStr && (ch == '"' || ch == '\'') {
-			inStr = true
-			strCh = ch
-			continue
-		}
-		if inStr && ch == strCh {
-			inStr = false
-			continue
-		}
-		if inStr {
-			continue
-		}
-		if ch == '{' {
-			depth++
-		} else if ch == '}' {
-			depth--
-			if depth == 0 {
-				chunk := html[bStart : bStart+i+1]
-				var out map[string]interface{}
-				if err := json.Unmarshal([]byte(chunk), &out); err != nil {
-					return nil
-				}
-				return out
-			}
-		}
-	}
-	return nil
-}
-
-// ─── xHamster ────────────────────────────────────────────────────────────────
-
-type VideoCard struct {
+type Video struct {
 	Title    string `json:"title"`
-	Href     string `json:"href"`
 	Poster   string `json:"poster"`
+	Href     string `json:"href"`
 	Duration string `json:"duration"`
+	Quality  string `json:"quality"`
 }
 
-func parseXhCards(doc *goquery.Document, base string) []VideoCard {
-	var items []VideoCard
-	doc.Find("div.thumb-list__item, .thumb-list .thumb").Each(func(_ int, el *goquery.Selection) {
-		a := el.Find("a.video-thumb-info__name").First()
-		title := strings.TrimSpace(a.Text())
-		href := a.AttrOr("href", "")
-		img := el.Find("img.thumb-image-container__image").First()
-		poster := strings.TrimSpace(img.AttrOr("data-src", img.AttrOr("src", "")))
-		dur := strings.TrimSpace(el.Find(".thumb-image-container__duration").Text())
-		if title != "" && href != "" {
-			items = append(items, VideoCard{Title: title, Href: absURL(href, base), Poster: poster, Duration: dur})
-		}
-	})
-	return items
-}
+// ─────────────────────────────────────────
+// ⚡ PARALLEL SCRAPER
 
-type SectionResult struct {
-	Name  string      `json:"name"`
-	Items interface{} `json:"items"`
-	Error string      `json:"error,omitempty"`
-}
+func scrapeTiava(cat, site string) ([]Video, error) {
+	base := categories[cat]
+	target := base + buildFilter(site)
 
-func xhHome(page int) map[string]interface{} {
-	cfg := sites["xhamster"]
-	secs := cfg.Sections
-	if len(secs) > 6 {
-		secs = secs[:6]
-	}
-	results := make([]SectionResult, len(secs))
-	done := make(chan int, len(secs))
-	for i, s := range secs {
-		go func(i int, slug, name string) {
-			pageURL := fmt.Sprintf("%s%s/%d?geo=us", cfg.Base, slug, page)
-			doc, _, err := fetchPage(pageURL, "xhamster")
-			if err != nil {
-				results[i] = SectionResult{Name: name, Items: []VideoCard{}, Error: err.Error()}
-			} else {
-				results[i] = SectionResult{Name: name, Items: parseXhCards(doc, cfg.Base)}
-			}
-			done <- i
-		}(i, s.Slug, s.Name)
-	}
-	for range secs {
-		<-done
-	}
-	return map[string]interface{}{"sections": results}
-}
-
-func xhSearch(query string, page int) (map[string]interface{}, error) {
-	cfg := sites["xhamster"]
-	q := strings.ReplaceAll(query, " ", "+")
-	u := fmt.Sprintf("%s/search/%s/?page=%d&x_platform_switch=desktop&geo=us", cfg.Base, q, page)
-	doc, _, err := fetchPage(u, "xhamster")
-	if err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{"items": parseXhCards(doc, cfg.Base)}, nil
-}
-
-func xhDetail(pageURL string) (map[string]interface{}, error) {
-	cleanURL := pageURL
-	if strings.Contains(pageURL, "?") {
-		cleanURL += "&geo=us"
-	} else {
-		cleanURL += "?geo=us"
-	}
-	doc, _, err := fetchPage(cleanURL, "xhamster")
+	doc, _, err := fetch(target)
 	if err != nil {
 		return nil, err
 	}
 
-	title := strings.TrimSpace(doc.Find("div.with-player-container h1, h1.page-title").First().Text())
-	if title == "" {
-		title = doc.Find("meta[property='og:title']").AttrOr("content", "Unknown")
-	}
+	var videos []Video
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 
-	poster := doc.Find("meta[property='og:image']").AttrOr("content", "")
-	if poster == "" {
-		style := doc.Find("div.xp-preload-image, .preload-image").First().AttrOr("style", "")
-		if m := regexp.MustCompile(`url\(['"']?(https?[^'")\s]+)['"']?\)`).FindStringSubmatch(style); len(m) > 1 {
-			poster = m[1]
-		}
-	}
+	doc.Find(".card").Each(func(i int, s *goquery.Selection) {
+		wg.Add(1)
 
-	var tags []string
-	doc.Find("a.video-tag, nav#video-tags-list-container a").Each(func(_ int, s *goquery.Selection) {
-		if t := strings.TrimSpace(s.Text()); t != "" {
-			tags = append(tags, t)
-		}
+		go func(s *goquery.Selection) {
+			defer wg.Done()
+
+			title := strings.TrimSpace(s.Find(".item-title span").Last().Text())
+			img, _ := s.Find("img.item-image").Attr("src")
+			link, _ := s.Find("a.item-link").Attr("href")
+
+			if title == "" || img == "" || link == "" {
+				return
+			}
+
+			full := "https://www.tiava.com" + link
+
+			badge := strings.TrimSpace(s.Find(".badge").Text())
+
+			quality := "HD"
+			if strings.Contains(badge, "4K") {
+				quality = "4K"
+			}
+
+			parts := strings.Fields(badge)
+			duration := ""
+			if len(parts) > 0 {
+				duration = parts[len(parts)-1]
+			}
+
+			video := Video{
+				Title:    title,
+				Poster:   img,
+				Href:     full,
+				Duration: duration,
+				Quality:  quality,
+			}
+
+			mu.Lock()
+			videos = append(videos, video)
+			mu.Unlock()
+		}(s)
 	})
 
-	var recs []VideoCard
-	doc.Find("div.related-container div.thumb-list__item, .related-container .thumb").Each(func(_ int, el *goquery.Selection) {
-		a := el.Find("a.video-thumb-info__name")
-		t := strings.TrimSpace(a.Text())
-		h := a.AttrOr("href", "")
-		img := el.Find("img")
-		p := img.AttrOr("data-src", img.AttrOr("src", ""))
-		if t != "" && h != "" {
-			recs = append(recs, VideoCard{Title: t, Href: absURL(h, sites["xhamster"].Base), Poster: p})
-		}
-	})
-	if tags == nil {
-		tags = []string{}
-	}
-	if recs == nil {
-		recs = []VideoCard{}
-	}
-	return map[string]interface{}{"title": title, "poster": poster, "tags": tags, "recs": recs, "pageUrl": pageURL}, nil
+	wg.Wait()
+	return videos, nil
 }
 
-type StreamLink struct {
-	Src   string `json:"src"`
-	Type  string `json:"type"`
-	Label string `json:"label"`
-}
+// ─────────────────────────────────────────
+// ⚡ STREAM EXTRACTOR (ONLY WHEN NEEDED)
 
-func xhLinks(pageURL string) (map[string]interface{}, error) {
-	cleanURL := pageURL
-	if strings.Contains(pageURL, "?") {
-		cleanURL += "&geo=us"
-	} else {
-		cleanURL += "?geo=us"
-	}
-	doc, html, err := fetchPage(cleanURL, "xhamster")
+func extractStream(pageURL string) (string, string) {
+	log.Printf("[stream] fetching page: %s", pageURL)
+
+	_, html, err := fetch(pageURL)
 	if err != nil {
-		return nil, err
+		log.Printf("[stream] ✗ fetch failed: %v", err)
+		return "", ""
 	}
+	log.Printf("[stream] page fetched (%d bytes)", len(html))
 
-	var links []StreamLink
-	seen := map[string]bool{}
-
-	// Strategy 1: <link rel=preload> with .m3u8
-	doc.Find("link[rel=preload]").Each(func(_ int, el *goquery.Selection) {
-		href := el.AttrOr("href", "")
-		if strings.Contains(href, ".m3u8") && !seen[href] {
-			seen[href] = true
-			links = append(links, StreamLink{Src: href, Type: "hls", Label: "HLS Stream"})
-		}
-	})
-
-	// Strategy 2: window.initials JSON
-	initials := extractJsonObject(html, "window.initials")
-	if initials != nil {
-		if xp, ok := getNestedMap(initials, "xplayerSettings"); ok {
-			if hlsURL, ok := getNestedString(xp, "sources", "hls", "h264", "url"); ok && !seen[hlsURL] {
-				seen[hlsURL] = true
-				links = append(links, StreamLink{Src: hlsURL, Type: "hls", Label: "HLS"})
-			}
-			if sources, ok := xp["sources"].(map[string]interface{}); ok {
-				if standard, ok := sources["standard"].(map[string]interface{}); ok {
-					if h264, ok := standard["h264"].([]interface{}); ok {
-						for _, q := range h264 {
-							if qm, ok := q.(map[string]interface{}); ok {
-								if u, ok := qm["url"].(string); ok && u != "" && !seen[u] {
-									seen[u] = true
-									label, _ := qm["quality"].(string)
-									if label == "" {
-										label = "MP4"
-									}
-									links = append(links, StreamLink{Src: u, Type: "mp4", Label: label})
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Strategy 3: direct m3u8 regex
-	if len(links) == 0 {
-		m3u8Re := regexp.MustCompile(`https?:[^\s"']+\.m3u8[^\s"']*`)
-		matches := dedupe(m3u8Re.FindAllString(html, -1))
-		for i, u := range matches {
-			links = append(links, StreamLink{Src: u, Type: "hls", Label: fmt.Sprintf("Stream %d", i+1)})
-		}
-	}
-
-	log.Printf("[xHamster links] found %d links for %s", len(links), pageURL)
-	if links == nil {
-		links = []StreamLink{}
-	}
-	return map[string]interface{}{"links": links}, nil
-}
-
-// ─── xVideos ──────────────────────────────────────────────────────────────────
-
-func cleanXvHref(href string) string {
-	re := regexp.MustCompile(`^(/video\.[^/]+)/[^/]+/[^/]+/(.+)$`)
-	if m := re.FindStringSubmatch(href); len(m) == 3 {
-		return m[1] + "/" + m[2]
-	}
-	return href
-}
-
-func parseXvCards(doc *goquery.Document, base string) []VideoCard {
-	var items []VideoCard
-	doc.Find("div.mozaique div.thumb-block").Each(func(_ int, el *goquery.Selection) {
-		a := el.Find("p.title a").First()
-		title := strings.TrimSpace(a.AttrOr("title", a.Text()))
-		rawHref := a.AttrOr("href", "")
-		if rawHref == "" || strings.Contains(rawHref, "/channels/") || strings.Contains(rawHref, "/pornstars/") {
-			return
-		}
-		href := absURL(cleanXvHref(rawHref), base)
-		img := el.Find("div.thumb a img").First()
-		poster := strings.TrimSpace(img.AttrOr("data-src", img.AttrOr("src", "")))
-		dur := strings.TrimSpace(el.Find("span.duration").Text())
-		if title != "" && href != "" {
-			if strings.Contains(poster, "blank") {
-				poster = ""
-			}
-			items = append(items, VideoCard{Title: title, Href: href, Poster: poster, Duration: dur})
-		}
-	})
-	return items
-}
-
-func xvHome(page int) map[string]interface{} {
-	cfg := sites["xvideos"]
-	secs := cfg.Sections
-	if len(secs) > 6 {
-		secs = secs[:6]
-	}
-	results := make([]SectionResult, len(secs))
-	done := make(chan int, len(secs))
-	for i, s := range secs {
-		go func(i int, slug, name string) {
-			var pageStr string
-			if page > 1 {
-				pageStr = fmt.Sprintf("/new/%d", page-1)
-			}
-			var pageURL string
-			if slug != "" {
-				pageURL = cfg.Base + slug + pageStr
-			} else {
-				if pageStr == "" {
-					pageURL = cfg.Base + "/"
-				} else {
-					pageURL = cfg.Base + pageStr
-				}
-			}
-			doc, _, err := fetchPage(pageURL, "xvideos")
-			if err != nil {
-				results[i] = SectionResult{Name: name, Items: []VideoCard{}, Error: err.Error()}
-			} else {
-				results[i] = SectionResult{Name: name, Items: parseXvCards(doc, cfg.Base)}
-			}
-			done <- i
-		}(i, s.Slug, s.Name)
-	}
-	for range secs {
-		<-done
-	}
-	return map[string]interface{}{"sections": results}
-}
-
-func xvSearch(query string, page int) (map[string]interface{}, error) {
-	cfg := sites["xvideos"]
-	u := fmt.Sprintf("%s/?k=%s&p=%d", cfg.Base, strings.ReplaceAll(query, " ", "+"), page-1)
-	doc, _, err := fetchPage(u, "xvideos")
-	if err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{"items": parseXvCards(doc, cfg.Base)}, nil
-}
-
-func xvDetail(pageURL string) (map[string]interface{}, error) {
-	doc, html, err := fetchPage(pageURL, "xvideos")
-	if err != nil {
-		return nil, err
-	}
-
-	h2 := doc.Find("h2.page-title").First().Clone()
-	h2.Find("span").Remove()
-	title := strings.TrimSpace(h2.Text())
-	if title == "" {
-		title = doc.Find("meta[property='og:title']").AttrOr("content", "Unknown")
-	}
-	poster := doc.Find("meta[property='og:image']").AttrOr("content", "")
-	dur := strings.TrimSpace(doc.Find("h2.page-title span.duration").Text())
-
-	var tags []string
-	doc.Find("div.video-tags-list li a.is-keyword, .video-tags a").Each(func(_ int, s *goquery.Selection) {
-		if t := strings.TrimSpace(s.Text()); t != "" {
-			tags = append(tags, t)
-		}
-	})
-
-	var recs []VideoCard
-	// Find inline script with video_related
-	scriptContent := ""
-	doc.Find("script").Each(func(_ int, s *goquery.Selection) {
-		if strings.Contains(s.Text(), "video_related") {
-			scriptContent = s.Text()
-		}
-	})
-	_ = html // html is available if needed for further extraction
-
-	recRe := regexp.MustCompile(`\{"id":\s*\d+.*?"u"\s*:\s*"(.*?)",\s*"i"\s*:\s*"(.*?)".*?"tf"\s*:\s*"(.*?)"`)
-	for _, m := range recRe.FindAllStringSubmatch(scriptContent, -1) {
-		rHref := strings.ReplaceAll(m[1], `\/`, "/")
-		rImg := strings.ReplaceAll(m[2], `\/`, "/")
-		rTitle := unescapeUnicode(m[3])
-		if rHref != "" {
-			recs = append(recs, VideoCard{Title: rTitle, Href: absURL(rHref, sites["xvideos"].Base), Poster: rImg})
-		}
-	}
-
-	if tags == nil {
-		tags = []string{}
-	}
-	if recs == nil {
-		recs = []VideoCard{}
-	}
-	return map[string]interface{}{"title": title, "poster": poster, "tags": tags, "duration": dur, "recs": recs, "pageUrl": pageURL}, nil
-}
-
-func xvLinks(pageURL string) (map[string]interface{}, error) {
-	_, html, err := fetchPage(pageURL, "xvideos")
-	if err != nil {
-		return nil, err
-	}
-
-	var links []StreamLink
-
+	// HLS via html5player (xhamster standard)
 	if m := regexp.MustCompile(`html5player\.setVideoHLS\('([^']+)'\)`).FindStringSubmatch(html); len(m) > 1 {
-		links = append(links, StreamLink{Src: m[1], Type: "hls", Label: "HLS (best)"})
+		log.Printf("[stream] ✓ found HLS (html5player.setVideoHLS): %s", m[1])
+		return m[1], "hls"
 	}
-	hiURL := ""
+
+	// MP4 high via html5player
 	if m := regexp.MustCompile(`html5player\.setVideoUrlHigh\('([^']+)'\)`).FindStringSubmatch(html); len(m) > 1 {
-		hiURL = m[1]
-		links = append(links, StreamLink{Src: m[1], Type: "mp4", Label: "High Quality"})
-	}
-	if m := regexp.MustCompile(`html5player\.setVideoUrl\('([^']+)'\)`).FindStringSubmatch(html); len(m) > 1 {
-		if m[1] != hiURL {
-			links = append(links, StreamLink{Src: m[1], Type: "mp4", Label: "Standard"})
-		}
+		log.Printf("[stream] ✓ found MP4 high (html5player.setVideoUrlHigh): %s", m[1])
+		return m[1], "mp4"
 	}
 
-	// Fallback CDN pattern
-	if len(links) == 0 {
-		cdnRe := regexp.MustCompile(`https?://[a-z0-9\-]+\.xvideos-cdn\.com/[^\s"']+\.m3u8`)
-		for i, u := range dedupe(cdnRe.FindAllString(html, -1)) {
-			links = append(links, StreamLink{Src: u, Type: "hls", Label: fmt.Sprintf("Stream %d", i+1)})
-		}
+	// xhamster JSON sources in window.initials (xhamster45.desi uses this)
+	if m := regexp.MustCompile(`"hls":\s*\{[^}]*"url":\s*"([^"]+\.m3u8[^"]*)"`).FindStringSubmatch(html); len(m) > 1 {
+		u := strings.ReplaceAll(m[1], `\/`, `/`)
+		log.Printf("[stream] ✓ found HLS (window.initials hls.url): %s", u)
+		return u, "hls"
 	}
 
-	log.Printf("[xVideos links] found %d links for %s", len(links), pageURL)
-	if links == nil {
-		links = []StreamLink{}
+	// xplayerSettings sources (used by xhspot/xhamster mirror sites)
+	if m := regexp.MustCompile(`xplayerSettings[^{]*\{[\s\S]*?"url"\s*:\s*"([^"]+\.m3u8[^"]*)"`).FindStringSubmatch(html); len(m) > 1 {
+		u := strings.ReplaceAll(m[1], `\/`, `/`)
+		log.Printf("[stream] ✓ found HLS (xplayerSettings): %s", u)
+		return u, "hls"
 	}
-	return map[string]interface{}{"links": links}, nil
-}
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-
-func dedupe(ss []string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, s := range ss {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
+	// any .m3u8 URL in page
+	if m := regexp.MustCompile(`https?://[^\s"'\\]+\.m3u8[^\s"'\\]*`).FindStringSubmatch(html); len(m) > 0 {
+		log.Printf("[stream] ✓ found HLS (generic .m3u8 scan): %s", m[0])
+		return m[0], "hls"
 	}
-	return out
-}
 
-func unescapeUnicode(s string) string {
-	re := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
-	return re.ReplaceAllStringFunc(s, func(m string) string {
-		var r rune
-		fmt.Sscanf(m[2:], "%x", &r)
-		if unicode.IsPrint(r) {
-			return string(r)
-		}
-		return m
-	})
-}
-
-func getNestedMap(m map[string]interface{}, key string) (map[string]interface{}, bool) {
-	v, ok := m[key].(map[string]interface{})
-	return v, ok
-}
-
-func getNestedString(m map[string]interface{}, keys ...string) (string, bool) {
-	cur := m
-	for i, k := range keys {
-		if i == len(keys)-1 {
-			if s, ok := cur[k].(string); ok {
-				return s, true
-			}
-			return "", false
-		}
-		next, ok := cur[k].(map[string]interface{})
-		if !ok {
-			return "", false
-		}
-		cur = next
+	// any .mp4 URL in page
+	if m := regexp.MustCompile(`https?://[^\s"'\\]+\.mp4[^\s"'\\]*`).FindStringSubmatch(html); len(m) > 0 {
+		log.Printf("[stream] ✓ found MP4 (generic .mp4 scan): %s", m[0])
+		return m[0], "mp4"
 	}
-	return "", false
+
+	log.Printf("[stream] ✗ no stream URL found in page. Check if Cloudflare is blocking (page size: %d bytes)", len(html))
+	// log first 500 chars to help debug
+	preview := html
+	if len(preview) > 500 {
+		preview = preview[:500]
+	}
+	log.Printf("[stream] page preview: %s", preview)
+	return "", ""
 }
 
-// ─── Server ───────────────────────────────────────────────────────────────────
-
-func writeJSON(w http.ResponseWriter, code int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(data)
-}
+// ─────────────────────────────────────────
+// API
 
 func main() {
-	mux := http.NewServeMux()
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]interface{}{
-			"name": "XWorld API",
-			"endpoints": []string{
-				"/api/home?site=xvideos", "/api/search?site=xvideos&q=test",
-				"/api/detail?site=xvideos&url=VIDEO_URL", "/api/links?site=xvideos&url=VIDEO_URL",
-			},
+	// 🎬 Get Videos (FAST)
+	http.HandleFunc("/api/videos", func(w http.ResponseWriter, r *http.Request) {
+		cat := r.URL.Query().Get("cat")
+		site := r.URL.Query().Get("site")
+
+		if cat == "" {
+			cat = "indian"
+		}
+		if site == "" {
+			site = "xhamster"
+		}
+
+		data, err := scrapeTiava(cat, site)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		json.NewEncoder(w).Encode(data)
+	})
+
+	// 🎯 Direct Play (ONLY when clicked)
+	http.HandleFunc("/api/play", func(w http.ResponseWriter, r *http.Request) {
+		u := r.URL.Query().Get("url")
+
+		// smart-decode /out/ URLs
+		if strings.Contains(u, "/out/") {
+			if real := resolveOutURL(u); real != "" {
+				u = real
+			}
+		}
+
+		// follow redirects for affiliate/partner URLs (e.g. xh.partners)
+		u = followRedirect(u)
+
+		stream, typ := extractStream(u)
+
+		json.NewEncoder(w).Encode(map[string]string{
+			"url":  stream,
+			"type": typ,
 		})
 	})
 
-	mux.HandleFunc("/api/home", func(w http.ResponseWriter, r *http.Request) {
-		site := strings.ToLower(r.URL.Query().Get("site"))
-		if site != "xhamster" && site != "xvideos" {
-			writeJSON(w, 400, map[string]string{"error": "site required (xhamster or xvideos)"})
-			return
-		}
-		page := 1
-		fmt.Sscanf(r.URL.Query().Get("page"), "%d", &page)
-		if site == "xhamster" {
-			writeJSON(w, 200, xhHome(page))
-		} else {
-			writeJSON(w, 200, xvHome(page))
-		}
-	})
+	log.Println("🔥 Ultra Fast Server → http://localhost:1235")
+	http.ListenAndServe(":1235", nil)
+}
 
-	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
-		site := strings.ToLower(r.URL.Query().Get("site"))
-		q := strings.TrimSpace(r.URL.Query().Get("q"))
-		if site != "xhamster" && site != "xvideos" {
-			writeJSON(w, 400, map[string]string{"error": "site required"})
-			return
+// ─────────────────────────────────────────
+// resolveOutURL — extracts real URL from tiava /out/ links using smartDecode
+
+func resolveOutURL(outURL string) string {
+	log.Printf("[decode] input /out/ URL: %s", outURL)
+
+	u, err := url.Parse(outURL)
+	if err != nil {
+		log.Printf("[decode] ✗ failed to parse URL: %v", err)
+		return ""
+	}
+	payload := u.Query().Get("l")
+	if payload == "" {
+		log.Printf("[decode] ✗ no 'l' param found in URL")
+		return ""
+	}
+	payload, _ = url.QueryUnescape(payload)
+	log.Printf("[decode] payload length: %d chars", len(payload))
+
+	results := smartDecode(payload)
+	log.Printf("[decode] extracted %d items", len(results))
+
+	for _, item := range results {
+		if s, ok := item.(string); ok && strings.HasPrefix(s, "http") {
+			log.Printf("[decode] ✓ resolved URL: %s", s)
+			return s
 		}
-		if q == "" {
-			writeJSON(w, 200, map[string]interface{}{"items": []VideoCard{}})
-			return
+	}
+	log.Printf("[decode] ✗ no HTTP URL found in decoded results")
+	return ""
+}
+
+// ─────────────────────────────────────────
+// followRedirect — follows 301/302 redirects to get the real final URL
+// handles affiliate/partner links like xh.partners that redirect to real pages
+
+var redirectClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 5,
+		IdleConnTimeout:     30 * time.Second,
+	},
+	// do NOT auto-follow — we track manually to log each hop
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+func followRedirect(u string) string {
+	current := u
+	const maxHops = 10
+
+	for i := 0; i < maxHops; i++ {
+		parsed, err := url.Parse(current)
+		if err != nil {
+			log.Printf("[redirect] ✗ bad URL at hop %d: %v", i, err)
+			return u // return original on error
 		}
-		page := 1
-		fmt.Sscanf(r.URL.Query().Get("page"), "%d", &page)
-		var res map[string]interface{}
+
+		// only follow known redirect domains, not real video hosts
+		host := parsed.Hostname()
+		if !isRedirectHost(host) {
+			if i > 0 {
+				log.Printf("[redirect] ✓ final URL after %d hop(s): %s", i, current)
+			}
+			return current
+		}
+
+		log.Printf("[redirect] hop %d → following: %s", i+1, current)
+
+		req, _ := http.NewRequest("GET", current, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		req.Header.Set("Referer", "https://www.tiava.com/")
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		req.Header.Set("Sec-CH-UA", `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`)
+		req.Header.Set("Sec-CH-UA-Mobile", "?0")
+		req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+
+		resp, err := redirectClient.Do(req)
+		if err != nil {
+			log.Printf("[redirect] ✗ request failed at hop %d: %v", i+1, err)
+			return current
+		}
+		resp.Body.Close()
+
+		location := resp.Header.Get("Location")
+		if location == "" {
+			log.Printf("[redirect] no Location header at hop %d (status %d), stopping", i+1, resp.StatusCode)
+			return current
+		}
+
+		// resolve relative redirects
+		if !strings.HasPrefix(location, "http") {
+			base, _ := url.Parse(current)
+			rel, _ := url.Parse(location)
+			location = base.ResolveReference(rel).String()
+		}
+
+		log.Printf("[redirect] hop %d → status %d → redirected to: %s", i+1, resp.StatusCode, location)
+		current = location
+	}
+
+	log.Printf("[redirect] ✗ max hops (%d) reached, using last URL: %s", maxHops, current)
+	return current
+}
+
+// isRedirectHost — returns true for known affiliate/partner redirect domains
+func isRedirectHost(host string) bool {
+	redirectHosts := []string{
+		"xh.partners",
+		"partners.xhamster.com",
+		"go.redirectingat.com",
+		"track.adtraction.com",
+		"clk.tradedoubler.com",
+	}
+	for _, h := range redirectHosts {
+		if host == h || strings.HasSuffix(host, "."+h) {
+			return true
+		}
+	}
+	return false
+}
+
+// ─────────────────────────────────────────
+// smartDecode — decodes base64 payload and extracts embedded data
+
+func smartDecode(payload string) []interface{} {
+	s := strings.SplitN(payload, "&", 2)[0]
+	s = removeWS(s)
+	log.Printf("[decode] cleaned payload length: %d (mod4=%d)", len(s), len(s)%4)
+
+	type strategy struct {
+		name    string
+		urlSafe bool
+	}
+	for _, st := range []strategy{{"standard", false}, {"url-safe", true}} {
+		input := s
+		if !st.urlSafe {
+			input = strings.NewReplacer("-", "+", "_", "/").Replace(input)
+		}
+		padded := smartFixPadding(input)
+
+		var decoded []byte
 		var err error
-		if site == "xhamster" {
-			res, err = xhSearch(q, page)
+		if st.urlSafe {
+			decoded, err = base64.URLEncoding.DecodeString(padded)
 		} else {
-			res, err = xvSearch(q, page)
+			decoded, err = base64.StdEncoding.DecodeString(padded)
 		}
 		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
+			log.Printf("[decode] ✗ %s base64 failed: %v", st.name, err)
+			continue
 		}
-		writeJSON(w, 200, res)
-	})
+		log.Printf("[decode] ✓ %s base64 succeeded (%d bytes)", st.name, len(decoded))
+		return extractEmbedded(decoded)
+	}
+	log.Printf("[decode] ✗ all base64 strategies failed")
+	return nil
+}
 
-	mux.HandleFunc("/api/detail", func(w http.ResponseWriter, r *http.Request) {
-		site := strings.ToLower(r.URL.Query().Get("site"))
-		u := r.URL.Query().Get("url")
-		if u == "" {
-			writeJSON(w, 400, map[string]string{"error": "url required"})
-			return
+// extractEmbedded pulls URLs, JSON, and nested base64 from decoded bytes
+
+var (
+	reEmbedURL  = regexp.MustCompile(`https?://[^\s\x00-\x1F]+`)
+	reEmbedJSON = regexp.MustCompile(`[\{\[][^{}\[\]]*?[\}\]]`)
+	reEmbedB64  = regexp.MustCompile(`[A-Za-z0-9+/]{30,}={0,2}`)
+	reEmbedCtrl = regexp.MustCompile(`[\x00-\x1F\x7F]`)
+)
+
+func extractEmbedded(data []byte) []interface{} {
+	var results []interface{}
+	seen := map[string]bool{}
+	text := strings.ToValidUTF8(string(data), "?")
+
+	// URLs
+	for _, u := range reEmbedURL.FindAllString(text, -1) {
+		u = reEmbedCtrl.Split(u, 2)[0]
+		if !seen[u] {
+			seen[u] = true
+			results = append(results, u)
 		}
-		if site != "xhamster" && site != "xvideos" {
-			writeJSON(w, 400, map[string]string{"error": "site required"})
-			return
+	}
+
+	// JSON objects/arrays
+	for _, cand := range reEmbedJSON.FindAllString(text, -1) {
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(cand), &parsed); err == nil && !seen[cand] {
+			seen[cand] = true
+			results = append(results, parsed)
 		}
-		var res map[string]interface{}
-		var err error
-		if site == "xhamster" {
-			res, err = xhDetail(u)
-		} else {
-			res, err = xvDetail(u)
-		}
+	}
+
+	// Nested base64
+	for _, match := range reEmbedB64.FindAllString(text, -1) {
+		inner, err := base64.StdEncoding.DecodeString(match)
 		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
+			continue
 		}
-		writeJSON(w, 200, res)
-	})
+		s := string(inner)
+		if !smartIsPrintable(s) || seen[s] {
+			continue
+		}
+		seen[s] = true
+		if strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
+			var parsed interface{}
+			if err := json.Unmarshal(inner, &parsed); err == nil {
+				results = append(results, parsed)
+				continue
+			}
+		}
+		results = append(results, s)
+	}
+	return results
+}
 
-	mux.HandleFunc("/api/links", func(w http.ResponseWriter, r *http.Request) {
-		site := strings.ToLower(r.URL.Query().Get("site"))
-		u := r.URL.Query().Get("url")
-		if u == "" {
-			writeJSON(w, 400, map[string]string{"error": "url required"})
-			return
+func removeWS(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
 		}
-		if site != "xhamster" && site != "xvideos" {
-			writeJSON(w, 400, map[string]string{"error": "site required"})
-			return
-		}
-		var res map[string]interface{}
-		var err error
-		if site == "xhamster" {
-			res, err = xhLinks(u)
-		} else {
-			res, err = xvLinks(u)
-		}
-		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, 200, res)
-	})
+		return r
+	}, s)
+}
 
-	log.Printf("\n🔞  XWorld backend → http://127.0.0.1:%d\n", PORT)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", PORT), mux))
+func smartFixPadding(s string) string {
+	rem := len(s) % 4
+	if rem == 1 {
+		s = s[:len(s)-1]
+		rem = len(s) % 4
+	}
+	switch rem {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+	return s
+}
+
+func smartIsPrintable(s string) bool {
+	for _, r := range s {
+		if r < 32 || r == 127 {
+			return false
+		}
+	}
+	return true
 }
