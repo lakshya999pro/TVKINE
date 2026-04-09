@@ -234,10 +234,31 @@ func extractStream(pageURL string) (string, string) {
 // ─────────────────────────────────────────
 // API
 
+// ─────────────────────────────────────────
+// cors — middleware that adds CORS headers to every response
+
+func cors(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// handle preflight
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		next(w, r)
+	}
+}
+
 func main() {
 
 	// 🎬 Get Videos (FAST)
-	http.HandleFunc("/api/videos", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/videos", cors(func(w http.ResponseWriter, r *http.Request) {
 		cat := r.URL.Query().Get("cat")
 		site := r.URL.Query().Get("site")
 
@@ -255,10 +276,10 @@ func main() {
 		}
 
 		json.NewEncoder(w).Encode(data)
-	})
+	}))
 
 	// 🎯 Direct Play (ONLY when clicked)
-	http.HandleFunc("/api/play", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/play", cors(func(w http.ResponseWriter, r *http.Request) {
 		u := r.URL.Query().Get("url")
 
 		// smart-decode /out/ URLs
@@ -277,7 +298,7 @@ func main() {
 			"url":  stream,
 			"type": typ,
 		})
-	})
+	}))
 
 	log.Println("🔥 Ultra Fast Server → http://localhost:1235")
 	http.ListenAndServe(":1235", nil)
